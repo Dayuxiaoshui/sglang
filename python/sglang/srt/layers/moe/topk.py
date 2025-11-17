@@ -74,6 +74,24 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _is_cuda:
     from sgl_kernel import kimi_k2_moe_fused_gate, moe_fused_gate
 
+    @torch.library.register_fake("sgl_kernel::kimi_k2_moe_fused_gate")
+    def _kimi_k2_moe_fused_gate(
+        input_tensor,
+        bias,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    ):
+        topk_weights = torch.new_empty(
+            input_tensor.shape[0], topk, device=input_tensor.device
+        )
+        topk_ids = torch.new_empty(
+            input_tensor.shape[0], topk, device=input_tensor.device
+        )
+        return topk_weights, topk_ids
+
+
 if _is_cuda or _is_hip:
     from sgl_kernel import topk_softmax
 if _use_aiter:
