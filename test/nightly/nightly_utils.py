@@ -239,7 +239,7 @@ class NightlyBenchmarkRunner:
             model=model_path,
             base_url=self.base_url,
             other_args=other_args or [],
-            timeout=2000,  # 33 minutes for large model downloads
+            timeout=7200,  # 2 hours for large model downloads like DeepSeek V3
         )
 
         try:

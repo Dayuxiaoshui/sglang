@@ -4,14 +4,14 @@ NeurIPS TP and MoE Configuration Testing
 This test runs batch-1 benchmarks with different TP sizes to find optimal
 configurations for large MoE models.
 
-Models are divided into two categories:
+All models use native precision (no FP8 quantization) for H200 compatibility:
 
-1. FP8-Compatible MoE Models (with flashinfer_trtllm backend):
-   - DeepSeek V3: TP4, TP8 with EP=2
+1. Large MoE Models:
+   - DeepSeek V3.1: TP4, TP8 with EP=2
    - Qwen 235B: TP4, TP8 with EP=2
    - Qwen Coder 480B: TP4, TP8 with EP=2
 
-2. Native-Precision MoE Models (no quantization, no backend flag):
+2. Smaller MoE Models:
    - Minimax M2: TP1, TP2, TP8 (230B total, 10B active - smaller model)
    - Kimi K2 Thinking: TP1, TP2, TP8 (smaller model, has built-in compressed-tensors)
    - GLM 4.6: TP8 only (357B large model)
@@ -20,8 +20,9 @@ Configuration details:
 - Batch size: 1
 - Input length: 4096
 - Output length: 512
-- Server timeout: 2000 seconds (for large model downloads)
-- TP8 configs use EP=2 to satisfy quantization block alignment
+- Server timeout: 7200 seconds (2 hours for large model downloads)
+- TP8 configs use EP=2 for optimal MoE parallelism
+- Native precision (no quantization) for H200 compatibility
 
 See NEURIPS_MOE_CONFIG_GUIDE.md for detailed configuration rules.
 """
@@ -43,48 +44,36 @@ BATCH_SIZES = [1]
 INPUT_LENS = (4096,)
 OUTPUT_LENS = (512,)
 
-# Models to test
-# Two categories:
-# 1. FP8-compatible MoE models: DeepSeek V3, Qwen 235B, Qwen Coder 480B
-#    - Use --quantization fp8 and --moe-runner-backend flashinfer_trtllm
-# 2. Native-precision MoE models: Minimax M2, Kimi K2, GLM 4.6
-#    - NO quantization flag, NO moe-runner-backend flag (use defaults)
+# Models to test - all using native precision for H200 compatibility
 MODELS = {
-    "deepseek-v3": {
-        "path": "deepseek-ai/DeepSeek-V3",
+    "deepseek-v3.1": {
+        "path": "deepseek-ai/DeepSeek-V3.1",
         "is_moe": True,
-        "use_fp8": True,
-        "extra_args": ["--trust-remote-code", "--quantization", "fp8"],
-    },
-    "qwen3-235b": {
-        "path": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
-        "is_moe": True,
-        "use_fp8": True,
         "extra_args": [
             "--trust-remote-code",
-            "--quantization",
-            "fp8",
-            "--mem-fraction-static",
-            "0.8",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true}',
         ],
     },
-    "qwen3-coder-480b": {
-        "path": "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+    "qwen3-235b": {
+        "path": "Qwen/Qwen3-235B-A22B-Instruct-2507",
         "is_moe": True,
-        "use_fp8": True,
-        "extra_args": ["--trust-remote-code", "--quantization", "fp8"],
+        "extra_args": ["--trust-remote-code"],
+    },
+    "qwen3-coder-480b": {
+        "path": "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+        "is_moe": True,
+        "extra_args": ["--trust-remote-code"],
     },
     "minimax-m2": {
         "path": "MiniMaxAI/MiniMax-M2",
         "is_moe": True,
-        "use_fp8": False,  # Native precision only
         "extra_args": ["--trust-remote-code"],
         "tp_sizes": [1, 2, 8],  # Smaller model (10B active params)
     },
     "kimi-k2": {
         "path": "moonshotai/Kimi-K2-Thinking",
         "is_moe": True,
-        "use_fp8": False,  # Has built-in compressed-tensors quantization
         "extra_args": [
             "--trust-remote-code",
             "--tool-call-parser",
@@ -96,8 +85,7 @@ MODELS = {
     },
     "glm-4-6": {
         "path": "zai-org/GLM-4.6",
-        "is_moe": True,  # 357B MoE model
-        "use_fp8": False,  # Native precision only
+        "is_moe": True,
         "extra_args": ["--trust-remote-code"],
         "tp_sizes": [8],  # Large model, only TP8
     },
@@ -106,12 +94,8 @@ MODELS = {
 # TP sizes to test
 TP_SIZES = [4, 8]
 
-# MoE backends to test (for MoE models only)
-# Note: flashinfer_cutlass requires modelopt_fp4, not fp8, so we only test flashinfer_trtllm
-MOE_BACKENDS = ["flashinfer_trtllm"]
-
-# Server launch timeout (33 minutes for large model downloads)
-SERVER_LAUNCH_TIMEOUT = 2000
+# Server launch timeout (2 hours for large model downloads like DeepSeek V3)
+SERVER_LAUNCH_TIMEOUT = 7200
 
 
 class TestNeurIPSTPMoEConfigs(unittest.TestCase):
@@ -133,103 +117,59 @@ class TestNeurIPSTPMoEConfigs(unittest.TestCase):
         for model_key, model_info in MODELS.items():
             model_path = model_info["path"]
             is_moe = model_info["is_moe"]
-            use_fp8 = model_info["use_fp8"]
             base_extra_args = model_info["extra_args"]
             # Use per-model TP sizes if specified, otherwise use default
             model_tp_sizes = model_info.get("tp_sizes", TP_SIZES)
 
             print(f"\n{'='*80}")
             print(f"Testing {model_key}: {model_path}")
-            print(f"MoE Model: {is_moe}, FP8: {use_fp8}")
+            print(f"MoE Model: {is_moe}, Native Precision")
             print(f"{'='*80}\n")
 
             for tp_size in model_tp_sizes:
                 # Build base server args with TP
                 server_args = ["--tp", str(tp_size)] + base_extra_args
 
-                # For TP8 with MoE models, add EP to avoid division errors
-                # (moe_intermediate_size / moe_tp_size) must be divisible by weight_block_size_n=128
-                # This applies to both FP8 and native-precision MoE models
+                # For TP8 with MoE models, add EP for optimal MoE parallelism
                 if is_moe and tp_size == 8:
                     server_args += ["--ep", "2"]  # moe_tp_size = 8/2 = 4
 
-                if is_moe and use_fp8:
-                    # FP8 MoE models: Test with flashinfer_trtllm backend
-                    for moe_backend in MOE_BACKENDS:
-                        ep_str = "_EP2" if tp_size == 8 else ""
-                        variant = f"TP{tp_size}{ep_str}_{moe_backend}"
-                        config_name = f"{model_key} {variant}"
-                        moe_server_args = server_args + [
-                            "--moe-runner-backend",
-                            moe_backend,
-                        ]
+                # All models use native precision (no quantization)
+                ep_str = "_EP2" if (is_moe and tp_size == 8) else ""
+                variant = f"TP{tp_size}{ep_str}"
+                config_name = f"{model_key} {variant}"
 
-                        print(f"\nRunning {config_name}...")
+                print(f"\nRunning {config_name}...")
 
-                        try:
-                            results, success = self.runner.run_benchmark_for_model(
-                                model_path=model_path,
-                                batch_sizes=BATCH_SIZES,
-                                input_lens=INPUT_LENS,
-                                output_lens=OUTPUT_LENS,
-                                other_args=moe_server_args,
-                                variant=variant,
-                            )
+                try:
+                    results, success = self.runner.run_benchmark_for_model(
+                        model_path=model_path,
+                        batch_sizes=BATCH_SIZES,
+                        input_lens=INPUT_LENS,
+                        output_lens=OUTPUT_LENS,
+                        other_args=server_args,
+                        variant=variant,
+                        extra_bench_args=["--trust-remote-code"],
+                    )
 
-                            if success and results:
-                                all_results.extend(results)
-                                self.runner.add_report(results)
-                                successful_configs.append(config_name)
-                                print(f"✓ Success: {config_name}")
-                            else:
-                                failed_configs.append(config_name)
-                                print(f"⚠️  Failed: {config_name}")
-                        except Exception as e:
-                            failed_configs.append(config_name)
-                            print(f"⚠️  Error running {config_name}: {e}")
-
-                        # Force garbage collection and wait for GPU memory to clear
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                            torch.cuda.synchronize()
-                        time.sleep(10)
-                else:
-                    # Native-precision MoE models: No MoE backend flag, use defaults
-                    ep_str = "_EP2" if (is_moe and tp_size == 8) else ""
-                    variant = f"TP{tp_size}{ep_str}"
-                    config_name = f"{model_key} {variant}"
-
-                    print(f"\nRunning {config_name}...")
-
-                    try:
-                        results, success = self.runner.run_benchmark_for_model(
-                            model_path=model_path,
-                            batch_sizes=BATCH_SIZES,
-                            input_lens=INPUT_LENS,
-                            output_lens=OUTPUT_LENS,
-                            other_args=server_args,
-                            variant=variant,
-                        )
-
-                        if success and results:
-                            all_results.extend(results)
-                            self.runner.add_report(results)
-                            successful_configs.append(config_name)
-                            print(f"✓ Success: {config_name}")
-                        else:
-                            failed_configs.append(config_name)
-                            print(f"⚠️  Failed: {config_name}")
-                    except Exception as e:
+                    if success and results:
+                        all_results.extend(results)
+                        self.runner.add_report(results)
+                        successful_configs.append(config_name)
+                        print(f"✓ Success: {config_name}")
+                    else:
                         failed_configs.append(config_name)
-                        print(f"⚠️  Error running {config_name}: {e}")
+                        print(f"⚠️  Failed: {config_name}")
+                except Exception as e:
+                    failed_configs.append(config_name)
+                    print(f"⚠️  Error running {config_name}: {e}")
 
-                    # Force garbage collection and wait for GPU memory to clear
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
-                    time.sleep(10)
+                # Force garbage collection and wait for GPU memory to clear
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                time.sleep(10)
 
         # Write final report to GitHub summary
         self.runner.write_final_report()
