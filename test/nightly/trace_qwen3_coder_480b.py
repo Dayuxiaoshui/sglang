@@ -35,6 +35,15 @@ CONFIGS = [
     ),  # TP4, EP1 - likely OOM
     (
         8,
+        1,
+        [
+            ("fp8", "flashinfer_trtllm", None, None),
+            ("auto", "triton", None, None),
+            ("auto", None, None, None),
+        ],
+    ),  # TP8, EP1 - may fail if expert count not divisible
+    (
+        8,
         2,
         [
             ("fp8", "flashinfer_trtllm", None, None),
