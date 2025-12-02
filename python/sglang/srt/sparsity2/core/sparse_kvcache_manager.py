@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.sparsity2.ops.triton_kernel import invoke_nsa_sparse_diff_kernel
+from sglang.srt.sparsity2.ops.triton_kernel import invoke_sparse_diff_kernel
 
 if TYPE_CHECKING:
     pass
@@ -99,10 +99,9 @@ class SparseKVCacheManager:
         seq_lens,
         layer_id,
     ):
-        nxtx_range = nvtx.start_range(message="init_buffer", color="blue")
         bs = top_k_result.shape[0]
         nxtx_range1 = nvtx.start_range(message="diff_kernel", color="blue")
-        invoke_nsa_sparse_diff_kernel(
+        invoke_sparse_diff_kernel(
             self.req_states.prev_top_k_result,
             top_k_result,
             self.req_states.prev_device_indices,
@@ -118,7 +117,8 @@ class SparseKVCacheManager:
         )
         nvtx.end_range(nxtx_range1)
 
-        nxtx_range2 = nvtx.start_range(message="io_kernel", color="blue")
+        # TODO: Move the operations into triton kernel
+        nxtx_range2 = nvtx.start_range(message="io_kernel_prepare", color="blue")
         should_load_device_indices = self.req_states.should_load_device_indices[:bs]
         should_load_device_indices = should_load_device_indices[
             should_load_device_indices != -1
@@ -128,6 +128,9 @@ class SparseKVCacheManager:
             should_load_host_indices != -1
         ]
         assert len(should_load_device_indices) == len(should_load_host_indices)
+        nvtx.end_range(nxtx_range2)
+
+        nxtx_range3 = nvtx.start_range(message="io_kernel_load", color="blue")
         if len(should_load_device_indices) > 0:
             # load cache from cpu
             self.host_mem_pool.load_to_device_per_layer(
@@ -137,7 +140,7 @@ class SparseKVCacheManager:
                 layer_id,
                 "kernel",
             )
-        nvtx.end_range(nxtx_range2)
+        nvtx.end_range(nxtx_range3)
         return self.req_states.curr_device_indices[:bs, :-1]
 
     def offload_sparse_decode_req_tokens(
@@ -185,18 +188,9 @@ class SparseKVCacheManager:
         host_indices, req_pool_indices, seq_lens = (
             self.sparse_decode_ongoing_offload.pop(ack_list[0])
         )
-        self.req_states.full_host_indices[req_pool_indices, seq_lens] = host_indices
-        # for i in range(len(req_pool_indices)):
-        #     full_host_indices = self.req_states.full_host_indices[req_pool_indices[i]]
-        #     if len(host_indices) > 0:
-        #         host_idx_i = host_indices[i].to(self.req_states.device).reshape(-1)
-        #         self.req_states.full_host_indices[req_pool_indices[i]] = torch.cat(
-        #             [full_host_indices, host_idx_i]
-        #         )
-        #     else:
-        #         logger.warning(
-        #             f"Host indices is empty for request {req_pool_indices[i]}"
-        #         )
+        self.req_states.full_host_indices[req_pool_indices, seq_lens] = host_indices.to(
+            self.req_states.device
+        )
 
     def offload_prefill_full_kv_cache(self, req):
         offloaded_len = len(req.origin_input_ids)

@@ -1,7 +1,6 @@
 from sglang.srt.sparsity2.algorithms import (
     BaseSparseAlgorithm,
     DeepSeekNSAAlgorithm,
-    FakeRandomSparseAlgorithm,
     PageMeanPoolingAlgorithm,
     SparseMode,
 )
@@ -20,7 +19,6 @@ from sglang.srt.sparsity2.factory import (
 __all__ = [
     "BaseSparseAlgorithm",
     "SparseMode",
-    "FakeRandomSparseAlgorithm",
     "PageMeanPoolingAlgorithm",
     "DeepSeekNSAAlgorithm",
     "BackendAdaptor",

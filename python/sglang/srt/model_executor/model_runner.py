@@ -1942,9 +1942,6 @@ class ModelRunner:
             return
 
         try:
-            from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
-                DecodeKVCacheOffloadManager,
-            )
             from sglang.srt.sparsity2 import create_sparse_coordinator
 
             # Get CPU group for offload communication

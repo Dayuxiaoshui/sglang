@@ -40,6 +40,78 @@ class BackendAdaptor(ABC):
         pass
 
 
+class NSABackendAdaptor(BackendAdaptor):
+    """Adaptor for NSA (Native Sparse Attention) backend."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        sparse_mode,
+        req_to_token_pool,
+        decode_offload_manager,
+    ):
+        super().__init__(device, sparse_mode)
+        self.req_to_token_pool = req_to_token_pool
+        self.decode_offload_manager = decode_offload_manager
+
+    @nvtx.annotate("NSABackendAdaptor.adapt_for_attn_metadata", color="green")
+    def adapt_for_attn_metadata(
+        self,
+        selected_indices: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        current_metadata: Any,
+        forward_batch: "ForwardBatch",
+        req_to_token: torch.Tensor,
+        page_size: int,
+        layer_id: int,
+        **kwargs,
+    ) -> Optional[torch.Tensor]:
+        """Transform NSA topk indices to physical device indices."""
+        if forward_batch.forward_mode.is_extend():
+            # Directly return the selected indices for extend mode
+            return selected_indices
+
+        req_pool_indices = forward_batch.req_pool_indices
+
+        # TODO: Remove the d2h transfer (nonzero & numel), using a unified kernel to support cuda graph.
+        transformed_indices = torch.empty_like(selected_indices, dtype=torch.int32)
+        hierarchical_indices = sparse_mask.nonzero(as_tuple=False).squeeze(1)
+        if hierarchical_indices.numel() > 0:
+            hierarchical_device_indices = (
+                self.decode_offload_manager.transfer_sparse_top_k_cache(
+                    req_pool_indices=req_pool_indices[hierarchical_indices],
+                    top_k_result=selected_indices[hierarchical_indices],
+                    out_cache_loc=forward_batch.out_cache_loc[hierarchical_indices],
+                    seq_lens=forward_batch.seq_lens[hierarchical_indices],
+                    layer_id=layer_id,
+                )
+            )
+            transformed_indices[hierarchical_indices] = hierarchical_device_indices.to(
+                torch.int32
+            )
+
+        non_hierarchical_indices = (~sparse_mask).nonzero(as_tuple=False).squeeze(1)
+        if non_hierarchical_indices.numel() > 0:
+            from sglang.srt.layers.attention.nsa.transform_index import (
+                transform_index_page_table_decode,
+            )
+
+            max_seqlen_k = int(forward_batch.seq_lens.max().item())
+            page_table = self.req_to_token_pool.req_to_token[
+                req_pool_indices[non_hierarchical_indices], :max_seqlen_k
+            ]
+            non_hierarchical_device_indices = transform_index_page_table_decode(
+                page_table=page_table,
+                topk_indices=selected_indices[non_hierarchical_indices],
+                page_size=1,
+            )
+            transformed_indices[non_hierarchical_indices] = (
+                non_hierarchical_device_indices
+            )
+        return transformed_indices
+
+
 class FlashAttentionAdaptor(BackendAdaptor):
     """Adaptor for FlashAttention backend."""
 
@@ -167,18 +239,6 @@ class FlashAttentionAdaptor(BackendAdaptor):
     ) -> Any:
         return current_metadata
 
-    def _logical_to_physical_pages(
-        self,
-        logical_page_ids: torch.Tensor,
-        req_pool_idx: int,
-        req_to_token: torch.Tensor,
-        page_size: int,
-    ) -> torch.Tensor:
-        page_starts = logical_page_ids * page_size
-        first_tokens = req_to_token[req_pool_idx, page_starts]
-        physical_page_ids = first_tokens // page_size
-        return physical_page_ids.to(dtype=torch.int32)
-
     def _logical_to_physical_pages_batch(
         self,
         logical_pages: torch.Tensor,
@@ -200,81 +260,3 @@ class FlashAttentionAdaptor(BackendAdaptor):
         )
 
         return physical_pages.to(torch.int32)
-
-
-class NSABackendAdaptor(BackendAdaptor):
-    """Adaptor for NSA (Native Sparse Attention) backend."""
-
-    def __init__(
-        self,
-        device: torch.device,
-        sparse_mode,
-        req_to_token_pool,
-        decode_offload_manager,
-    ):
-        super().__init__(device, sparse_mode)
-        self.req_to_token_pool = req_to_token_pool
-        self.decode_offload_manager = decode_offload_manager
-
-    @nvtx.annotate("NSABackendAdaptor.adapt_for_attn_metadata", color="green")
-    def adapt_for_attn_metadata(
-        self,
-        selected_indices: torch.Tensor,
-        valid_lengths: torch.Tensor,
-        sparse_mask: torch.Tensor,
-        current_metadata: Any,
-        forward_batch: "ForwardBatch",
-        req_to_token: torch.Tensor,
-        page_size: int,
-        layer_id: int,
-        **kwargs,
-    ) -> Optional[torch.Tensor]:
-        """Transform NSA topk indices to physical device indices."""
-        if forward_batch.forward_mode.is_extend():
-            # Directly return the selected indices for extend mode
-            return selected_indices
-
-        req_pool_indices = forward_batch.req_pool_indices
-
-        transformed_indices = torch.empty_like(selected_indices, dtype=torch.int32)
-        hierarchical_indices = sparse_mask.nonzero(as_tuple=False).squeeze(1)
-        if hierarchical_indices.numel() > 0:
-            hierarchical_device_indices = (
-                self.decode_offload_manager.transfer_sparse_top_k_cache(
-                    req_pool_indices=req_pool_indices[hierarchical_indices],
-                    top_k_result=selected_indices[hierarchical_indices],
-                    out_cache_loc=forward_batch.out_cache_loc[hierarchical_indices],
-                    seq_lens=forward_batch.seq_lens[hierarchical_indices],
-                    layer_id=layer_id,
-                )
-            )
-            transformed_indices[hierarchical_indices] = hierarchical_device_indices.to(
-                torch.int32
-            )
-
-        non_hierarchical_indices = (~sparse_mask).nonzero(as_tuple=False).squeeze(1)
-        if non_hierarchical_indices.numel() > 0:
-            from sglang.srt.layers.attention.nsa.transform_index import (
-                transform_index_page_table_decode,
-            )
-
-            max_seqlen_k = int(forward_batch.seq_lens.max().item())
-            page_table = self.req_to_token_pool.req_to_token[
-                req_pool_indices[non_hierarchical_indices], :max_seqlen_k
-            ]
-            non_hierarchical_device_indices = transform_index_page_table_decode(
-                page_table=page_table,
-                topk_indices=selected_indices[non_hierarchical_indices],
-                page_size=1,
-            )
-            transformed_indices[non_hierarchical_indices] = (
-                non_hierarchical_device_indices
-            )
-
-        if layer_id == 0:
-            logger.info(
-                f"NSA transformed: shape={transformed_indices.shape}, "
-                f"head={transformed_indices[:, :20].tolist()}"
-            )
-
-        return transformed_indices

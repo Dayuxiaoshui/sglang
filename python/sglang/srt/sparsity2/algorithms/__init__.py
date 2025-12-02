@@ -1,15 +1,13 @@
 from sglang.srt.sparsity2.algorithms.base_algorithm import (
     BaseSparseAlgorithm,
-    FakeRandomSparseAlgorithm,
+    PageMeanPoolingAlgorithm,
     SparseMode,
 )
 from sglang.srt.sparsity2.algorithms.deepseek_nsa import DeepSeekNSAAlgorithm
-from sglang.srt.sparsity2.algorithms.page_mean_pooling import PageMeanPoolingAlgorithm
 
 __all__ = [
     "BaseSparseAlgorithm",
     "SparseMode",
-    "FakeRandomSparseAlgorithm",
     "PageMeanPoolingAlgorithm",
     "DeepSeekNSAAlgorithm",
 ]

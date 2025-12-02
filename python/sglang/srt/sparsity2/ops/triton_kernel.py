@@ -4,7 +4,7 @@ import triton.language as tl
 
 
 @triton.jit
-def nsa_sparse_diff_triton_kernel(
+def sparse_diff_triton_kernel(
     prev_top_k_result_ptr,
     curr_top_k_result_ptr,
     prev_device_indices_ptr,
@@ -29,7 +29,10 @@ def nsa_sparse_diff_triton_kernel(
     layer_id: tl.constexpr,
     TOPK: tl.constexpr,
 ):
-    """Optimized version with vectorized operations instead of serial loops."""
+    """
+    Compute sparse KV cache diff between prev and curr top-k results.
+    Determines which indices to load from device/host memory.
+    """
     bid = tl.program_id(0)
     offset = tl.arange(0, TOPK)
     req_pool_index = tl.load(req_pool_indices_ptr + bid)
@@ -44,7 +47,7 @@ def nsa_sparse_diff_triton_kernel(
         + layer_id * prev_device_indices_stride_1
     )
 
-    # Refill -1
+    # Initialize output buffers to -1
     tl.store(curr_device_indices_ptr + curr_device_indices_stride * bid + offset, -1)
     tl.store(curr_device_indices_ptr + curr_device_indices_stride * bid + TOPK, -1)
     tl.store(
@@ -58,7 +61,7 @@ def nsa_sparse_diff_triton_kernel(
         -1,
     )
 
-    # Load current top-k (save for later update)
+    # Save current top-k for state update at the end
     tmp_curr_top_k_result = tl.load(
         curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
     )
@@ -67,6 +70,7 @@ def nsa_sparse_diff_triton_kernel(
     max_val = tl.max(prev_top_k_result)
     seq_len = tl.load(seq_lens_ptr + bid)
 
+    # Handle first iteration when no previous top-k exists
     if max_val == -1:
         no_exist_top_k_result = tl.load(
             curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
@@ -86,11 +90,13 @@ def nsa_sparse_diff_triton_kernel(
             mask=mask,
         )
     else:
-        # Use atomic_max to ensure deterministic result when prev_top_k_result has duplicates
+        # Build bitmap: mark prev top-k positions with their indices in top-k array
+        # atomic_max ensures deterministic result when duplicates exist
         tl.atomic_max(
             bitmap_ptr + bitmap_stride * bid + prev_top_k_result, offset.to(tl.int32)
         )
 
+        # Clear previous output cache location from tracking if it exists
         prev_out_cache_loc_index = tl.load(
             bitmap_ptr + bitmap_stride * bid + seq_len - 1
         )
@@ -98,11 +104,13 @@ def nsa_sparse_diff_triton_kernel(
             tl.store(bitmap_ptr + bitmap_stride * bid + seq_len - 1, -1)
             tl.store(prev_device_indices_start_ptr + prev_out_cache_loc_index, -1)
 
+        # Check which current top-k indices exist in previous top-k using bitmap
         curr_top_k_result = tl.load(
             curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
         )
         exist_indices = tl.load(bitmap_ptr + bitmap_stride * bid + curr_top_k_result)
 
+        # Reuse existing device indices for overlapping entries
         mask = exist_indices >= 0
         exist_prev_device_indices = tl.load(
             prev_device_indices_start_ptr + exist_indices,
@@ -114,6 +122,7 @@ def nsa_sparse_diff_triton_kernel(
             mask=mask,
         )
 
+        # Mark reused entries as consumed (-1)
         tl.store(
             prev_device_indices_start_ptr + exist_indices,
             -1,
@@ -126,6 +135,7 @@ def nsa_sparse_diff_triton_kernel(
         )
         tl.store(bitmap_ptr + bitmap_stride * bid + prev_top_k_result, -1)
 
+        # Collect host indices for non-existing entries
         no_exist_top_k_result = tl.load(
             curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
         )
@@ -146,6 +156,7 @@ def nsa_sparse_diff_triton_kernel(
             mask=host_mask,
         )
 
+    # Handle output cache location (newly generated token position)
     out_cache_loc = tl.load(out_cache_loc_ptr + bid)
     curr_top_k_result = tl.load(
         curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
@@ -157,7 +168,7 @@ def nsa_sparse_diff_triton_kernel(
         mask=out_cache_loc_mask,
     )
 
-    # Vectorized compaction (replaces serial loop 1)
+    # Vectorized compaction: collect evicted device indices (to be reused)
     device_vals_topk = tl.load(prev_device_indices_start_ptr + offset)
     device_valid_topk = device_vals_topk != -1
     device_valid_topk_int = device_valid_topk.to(tl.int32)
@@ -185,6 +196,7 @@ def nsa_sparse_diff_triton_kernel(
         )
         device_count = device_count_topk + 1
 
+    # Compact host indices using cumsum-based vectorized compaction
     host_vals_all = tl.load(
         should_load_host_indices_ptr + should_load_host_indices_stride * bid + offset
     )
@@ -202,7 +214,7 @@ def nsa_sparse_diff_triton_kernel(
     )
     host_count = tl.sum(host_valid_int)
 
-    # Vectorized fill (replaces serial loop 2)
+    # Fill empty slots in curr_device_indices with evicted device indices
     curr_vals_topk = tl.load(
         curr_device_indices_ptr + curr_device_indices_stride * bid + offset
     )
@@ -238,7 +250,7 @@ def nsa_sparse_diff_triton_kernel(
             fill_val_last,
         )
 
-    # Clear invalid entries
+    # Clear trailing invalid entries after compaction
     clear_mask = offset >= host_count
     tl.store(
         should_load_device_indices_ptr
@@ -253,7 +265,7 @@ def nsa_sparse_diff_triton_kernel(
         mask=clear_mask,
     )
 
-    # Update state
+    # Update prev state for next iteration
     tl.store(prev_top_k_result_start_ptr + offset, tmp_curr_top_k_result)
     curr_device_indices = tl.load(
         curr_device_indices_ptr + curr_device_indices_stride * bid + offset
@@ -265,7 +277,7 @@ def nsa_sparse_diff_triton_kernel(
     tl.store(prev_device_indices_start_ptr + TOPK, last_index)
 
 
-def invoke_nsa_sparse_diff_kernel(
+def invoke_sparse_diff_kernel(
     prev_top_k_result_pool: torch.Tensor,
     curr_top_k_result: torch.Tensor,
     prev_device_indices_pool: torch.Tensor,
@@ -282,7 +294,7 @@ def invoke_nsa_sparse_diff_kernel(
     bs = curr_top_k_result.shape[0]
     top_k = curr_top_k_result.shape[1]
     grid = (bs,)
-    nsa_sparse_diff_triton_kernel[grid](
+    sparse_diff_triton_kernel[grid](
         prev_top_k_result_pool,
         curr_top_k_result,
         prev_device_indices_pool,
@@ -416,7 +428,7 @@ if __name__ == "__main__":
         (bs, top_k), -1, dtype=torch.int64, device="cuda"
     )
 
-    invoke_nsa_sparse_diff_kernel(
+    invoke_sparse_diff_kernel(
         prev_top_k_result_pool,
         curr_top_k_result,
         prev_device_indices_pool,
@@ -621,7 +633,7 @@ if __name__ == "__main__":
     )
 
     time_large_orig = benchmark_kernel(
-        lambda *args: invoke_nsa_sparse_diff_kernel(
+        lambda *args: invoke_sparse_diff_kernel(
             prev_top_k_result_pool_large.clone(),
             curr_top_k_result_large.clone(),
             prev_device_indices_pool_large.clone(),
