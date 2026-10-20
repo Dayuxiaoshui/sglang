@@ -27,7 +27,7 @@ _MIN_TRANSFER_TIMEOUT_S = 5
 
 # Requests per TENT batch and submit threads. A batch status poll scans every task,
 # and submit_transfer releases the GIL, so small chunks on a pool overlap building
-# requests with submitting them. Measured on H20 + 200G RoCE; re-tune on new hardware.
+# requests with submitting them. Tuned for per-request CPU cost; re-measure if it changes.
 _SUBMIT_CHUNK = 128
 _SUBMIT_THREADS = 4
 # Busy-poll this many times per batch before yielding the CPU between polls.
