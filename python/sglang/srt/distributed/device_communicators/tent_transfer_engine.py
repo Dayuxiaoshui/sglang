@@ -28,8 +28,9 @@ _MIN_TRANSFER_TIMEOUT_S = 5
 # Requests per TENT batch and submit threads. A batch status poll scans every task,
 # and submit_transfer releases the GIL, so small chunks on a pool overlap building
 # requests with submitting them. Tuned for per-request CPU cost; re-measure if it changes.
+# More threads contend with the scheduler thread for the GIL and slow scheduling.
 _SUBMIT_CHUNK = 128
-_SUBMIT_THREADS = 4
+_SUBMIT_THREADS = 2
 # Busy-poll this many times per batch before yielding the CPU between polls.
 # Arbitrary; polling cadence had no measurable effect on throughput.
 _SPIN_POLLS = 64
