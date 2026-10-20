@@ -31,9 +31,22 @@ def _make_fake_tent(fail_batch_index=None, raise_on_submit_source=None):
         PENDING, COMPLETED, FAILED = "PENDING", "COMPLETED", "FAILED"
         TIMEOUT, CANCELED, INVALID = "TIMEOUT", "CANCELED", "INVALID"
 
+    class TransportType:
+        UNSPEC = "UNSPEC"
+
+    class IntentType:
+        INTENT_UNSPEC = "INTENT_UNSPEC"
+        FOREGROUND_GET = "FOREGROUND_GET"
+        BACKGROUND_PREFETCH = "BACKGROUND_PREFETCH"
+
     class Request:
-        def __init__(self, opcode, source, target_id, target_offset, length):
+        # Mirrors the pybind signature: tail is (priority, transport_hint,
+        # policy_name, deadline_ns, intent_type), all optional.
+        def __init__(self, opcode, source, target_id, target_offset, length, *tail):
+            assert len(tail) in (0, 5), tail
             self.args = (opcode, source, target_id, target_offset, length)
+            self.priority = tail[0] if tail else "PRIO_HIGH"
+            self.intent_type = tail[4] if tail else IntentType.INTENT_UNSPEC
 
     class Status:
         def __init__(self, state):
@@ -46,6 +59,7 @@ def _make_fake_tent(fail_batch_index=None, raise_on_submit_source=None):
             self.submitted = []
             self.freed = []
             self.allocated = []
+            self.qos = []
             self.opened = []
             self.closed = []
             self.unregistered = []
@@ -79,6 +93,7 @@ def _make_fake_tent(fail_batch_index=None, raise_on_submit_source=None):
             if any(r.args[1] == raise_on_submit_source for r in requests):
                 raise InternalError("injected submit failure")
             self.submitted.append((batch_id, [r.args for r in requests]))
+            self.qos.extend((r.priority, r.intent_type) for r in requests)
 
         def get_transfer_status_overall(self, batch_id):
             index = [b for b, _ in self.submitted].index(batch_id)
@@ -96,6 +111,10 @@ def _make_fake_tent(fail_batch_index=None, raise_on_submit_source=None):
         TransferStatusEnum=TransferStatusEnum,
         Request=Request,
         TransferEngine=TransferEngine,
+        TransportType=TransportType,
+        IntentType=IntentType,
+        PRIO_HIGH="PRIO_HIGH",
+        PRIO_LOW="PRIO_LOW",
     ).items():
         setattr(mod, name, value)
     return mod
@@ -165,6 +184,27 @@ class TestTentTransferEngine(CustomTestCase):
         # Every allocated batch, including the one whose submit raised, freed once.
         self.assertEqual(sorted(engine.engine.freed), sorted(engine.engine.allocated))
         self.assertEqual(len(engine.engine.allocated), 4)
+
+    def test_intent_reaches_every_request_and_none_keeps_default(self):
+        """Foreground/background must map to TENT's QoS intents on every chunk."""
+        from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
+            TransferIntent,
+        )
+
+        expected = {
+            None: ("PRIO_HIGH", "INTENT_UNSPEC"),
+            TransferIntent.FOREGROUND: ("PRIO_HIGH", "FOREGROUND_GET"),
+            TransferIntent.BACKGROUND: ("PRIO_LOW", "BACKGROUND_PREFETCH"),
+        }
+        for intent, qos in expected.items():
+            with self.subTest(intent=intent):
+                engine, chunk = self._engine()
+                n = chunk * 2 + 1
+                rc = engine.batch_transfer_sync(
+                    "10.0.0.2:7000", [1] * n, [2] * n, [8] * n, intent
+                )
+                self.assertEqual(rc, 0)
+                self.assertEqual(engine.engine.qos, [qos] * n)
 
     def test_deregister_passes_registered_lengths(self):
         engine, _ = self._engine()

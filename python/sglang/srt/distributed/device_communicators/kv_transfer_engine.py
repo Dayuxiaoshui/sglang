@@ -3,7 +3,17 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import List, Optional
+
+
+class TransferIntent(str, Enum):
+    """What a transfer is for; engines that support QoS map it to an isolated lane."""
+
+    # On a request's critical path, e.g. PD KV cache the decode side waits for.
+    FOREGROUND = "foreground"
+    # Throughput traffic nobody waits on now, e.g. storage write-back or prefetch.
+    BACKGROUND = "background"
 
 
 class KVTransferEngine(ABC):
@@ -35,14 +45,23 @@ class KVTransferEngine(ABC):
         buffers: List[int],
         peer_buffer_addresses: List[int],
         lengths: List[int],
+        intent: Optional[TransferIntent] = None,
     ) -> int:
-        """RDMA-write local `buffers` to the peer's addresses; blocks until done."""
+        """RDMA-write local `buffers` to the peer's addresses; blocks until done.
+
+        `intent` is a hint; engines without QoS support ignore it.
+        """
 
     def transfer_sync(
-        self, session_id: str, buffer: int, peer_buffer_address: int, length: int
+        self,
+        session_id: str,
+        buffer: int,
+        peer_buffer_address: int,
+        length: int,
+        intent: Optional[TransferIntent] = None,
     ) -> int:
         return self.batch_transfer_sync(
-            session_id, [buffer], [peer_buffer_address], [length]
+            session_id, [buffer], [peer_buffer_address], [length], intent
         )
 
     @abstractmethod

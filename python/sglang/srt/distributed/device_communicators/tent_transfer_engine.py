@@ -9,10 +9,11 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
     KVTransferEngine,
+    TransferIntent,
 )
 from sglang.srt.environ import envs
 from sglang.srt.utils.network import NetworkAddress
@@ -33,6 +34,10 @@ _SUBMIT_THREADS = 4
 # Arbitrary; polling cadence had no measurable effect on throughput.
 _SPIN_POLLS = 64
 _POLL_SLEEP_S = 20e-6
+
+# tent.Request arguments after `length`: (priority, transport_hint, policy_name,
+# deadline_ns, intent_type). Empty means TENT's defaults.
+_RequestTail = Tuple[Any, ...]
 
 
 def _build_tent_config(hostname: str, ib_device: Optional[str]) -> dict:
@@ -108,6 +113,24 @@ class TentTransferEngine(KVTransferEngine):
                 "build Mooncake with -DUSE_TENT=ON and put tent.*.so on PYTHONPATH."
             ) from e
         self._tent = tent
+        # Passed positionally: the intent_type= keyword doubles request build cost.
+        self._request_tail: Dict[Optional[TransferIntent], _RequestTail] = {
+            None: (),
+            TransferIntent.FOREGROUND: (
+                tent.PRIO_HIGH,
+                tent.TransportType.UNSPEC,
+                None,
+                0,
+                tent.IntentType.FOREGROUND_GET,
+            ),
+            TransferIntent.BACKGROUND: (
+                tent.PRIO_LOW,
+                tent.TransportType.UNSPEC,
+                None,
+                0,
+                tent.IntentType.BACKGROUND_PREFETCH,
+            ),
+        }
         self._failed_states = (
             tent.TransferStatusEnum.FAILED,
             tent.TransferStatusEnum.TIMEOUT,
@@ -189,6 +212,7 @@ class TentTransferEngine(KVTransferEngine):
         buffers: List[int],
         peer_buffer_addresses: List[int],
         lengths: List[int],
+        intent: Optional[TransferIntent] = None,
     ) -> int:
         if not (len(buffers) == len(peer_buffer_addresses) == len(lengths)):
             logger.error("buffers, peer_buffer_addresses and lengths differ in size")
@@ -202,6 +226,7 @@ class TentTransferEngine(KVTransferEngine):
                 buffers=buffers,
                 peer_buffer_addresses=peer_buffer_addresses,
                 lengths=lengths,
+                request_tail=self._request_tail[intent],
             )
         except self._tent.TentException as exc:
             logger.error(
@@ -256,6 +281,7 @@ class TentTransferEngine(KVTransferEngine):
         buffers: List[int],
         peer_buffer_addresses: List[int],
         lengths: List[int],
+        request_tail: _RequestTail,
     ) -> int:
         deadline_ns = time.monotonic_ns() + self._timeout_ns + sum(lengths)
         batch_ids = self._submit_all(
@@ -263,6 +289,7 @@ class TentTransferEngine(KVTransferEngine):
             buffers=buffers,
             peer_buffer_addresses=peer_buffer_addresses,
             lengths=lengths,
+            request_tail=request_tail,
         )
         try:
             for batch_id in batch_ids:
@@ -280,6 +307,7 @@ class TentTransferEngine(KVTransferEngine):
         buffers: List[int],
         peer_buffer_addresses: List[int],
         lengths: List[int],
+        request_tail: _RequestTail,
     ) -> List[int]:
         """Submit every chunk; on any failure free what was submitted and re-raise."""
 
@@ -290,6 +318,7 @@ class TentTransferEngine(KVTransferEngine):
                 buffers=buffers[start:end],
                 peer_buffer_addresses=peer_buffer_addresses[start:end],
                 lengths=lengths[start:end],
+                request_tail=request_tail,
             )
 
         starts = range(0, len(buffers), _SUBMIT_CHUNK)
@@ -322,11 +351,12 @@ class TentTransferEngine(KVTransferEngine):
         buffers: List[int],
         peer_buffer_addresses: List[int],
         lengths: List[int],
+        request_tail: _RequestTail,
     ) -> int:
         request = self._tent.Request
         write = self._tent.OpCode.WRITE
         requests = [
-            request(write, src, handle, dst, length)
+            request(write, src, handle, dst, length, *request_tail)
             for src, dst, length in zip(buffers, peer_buffer_addresses, lengths)
         ]
         batch_id = self.engine.allocate_transfer_batch(len(requests))

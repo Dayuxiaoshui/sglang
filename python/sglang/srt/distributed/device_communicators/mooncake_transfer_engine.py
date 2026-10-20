@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
     KVTransferEngine,
+    TransferIntent,
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
@@ -226,7 +227,12 @@ class MooncakeTransferEngine(KVTransferEngine):
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
 
     def transfer_sync(
-        self, session_id: str, buffer: int, peer_buffer_address: int, length: int
+        self,
+        session_id: str,
+        buffer: int,
+        peer_buffer_address: int,
+        length: int,
+        intent: Optional[TransferIntent] = None,
     ) -> int:
         """Synchronously transfer data to the specified address."""
         try:
@@ -252,8 +258,12 @@ class MooncakeTransferEngine(KVTransferEngine):
         buffers: List[int],
         peer_buffer_addresses: List[int],
         lengths: List[int],
+        intent: Optional[TransferIntent] = None,
     ) -> int:
-        """Synchronously transfer data to the specified addresses in batches."""
+        """Synchronously transfer data to the specified addresses in batches.
+
+        Classic TE has no QoS lanes, so `intent` is ignored.
+        """
         try:
             ret = self.engine.batch_transfer_sync_write(
                 session_id, buffers, peer_buffer_addresses, lengths
